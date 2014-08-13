@@ -6,6 +6,8 @@ from feedparser import parse
 
 from BeautifulSoup import BeautifulSoup
 
+from errbot.utils import get_sender_username
+
 # Backward compatibility
 from errbot.version import VERSION
 from errbot.utils import version2array
@@ -20,14 +22,42 @@ __author__ = 'atalyad'
 
 
 def get_item_date(rss_item):
-    return datetime(rss_item.published_parsed.tm_year,
-                    rss_item.published_parsed.tm_mon,
-                    rss_item.published_parsed.tm_mday,
-                    rss_item.published_parsed.tm_hour,
-                    rss_item.published_parsed.tm_min,
-                    rss_item.published_parsed.tm_sec)
+    time = getattr(rss_item, 'published_parsed', None)
+    time = time or getattr(rss_item, 'updated_parsed', None)
+    if time:
+        return datetime(time.tm_year,
+                        time.tm_mon,
+                        time.tm_mday,
+                        time.tm_hour,
+                        time.tm_min,
+                        time.tm_sec)
+    return datetime.now()
 
 DEFAULT_POLL_INTERVAL = 1800
+
+class Subscription(object):
+    def __init__(self, url, name, username=None):
+        self.name = name
+        self.url = url
+        self.username = username if username else ''
+        self.last_timestamp = datetime.now()
+
+    def has_new_items(self):
+        if self.get_new_item(mark_read=False):
+            return True
+        return False
+
+    def get_new_item(self, mark_read=False):
+        feed = parse(self.url)
+        if feed['entries']:
+            latest = feed['entries'][0]
+            latest_timestamp = get_item_date(latest)
+            if latest_timestamp > self.last_timestamp:
+                if mark_read:
+                    self.last_timestamp = latest_timestamp
+                return latest
+        return None
+
 
 class RSSFeedPlugin(BotPlugin):
     min_err_version = '1.4.0' # it needs the new polling feature
@@ -50,29 +80,53 @@ class RSSFeedPlugin(BotPlugin):
                 raise Exception('POLL_INTERVAL must be an integer')
         super(RSSFeedPlugin, self).configure(configuration)
 
+    def get_subscriptions(self, username=None):
+        if username:
+            user_subscriptions = self.get('user_subscriptions', {})
+            return user_subscriptions.get(username, {}).values()
+        
+        return self.get('group_subscriptions', {}).values()
 
-    def get_subscriptions_last_ts(self):
-        return self.get('subscriptions_last_ts', {})
+    def get_all_subscriptions(self):
+        user_subscriptions = self.get('user_subscriptions', {})
+        subscriptions = [item for subscriptions in user_subscriptions.values() for item in subscriptions.values()]
+        subscriptions.extend(self.get('group_subscriptions', {}).values())
+        return subscriptions
 
-    def get_subscription_names(self):
-        return self.get('subscription_names', {})
+    def add_subscription(self, url, name, username=None):
+        new = Subscription(url, name, username)
+        if username:
+            user_subscriptions = self.get('user_subscriptions', {})
+            if username not in user_subscriptions:
+                user_subscriptions[username] = {}
+            user_subscriptions[username][name] = new
+            self['user_subscriptions'] = user_subscriptions
+        else:
+            group_subscriptions = self.get('group_subscriptions', {})
+            group_subscriptions[name] = new
+            self['group_subscriptions'] = group_subscriptions
 
-    def add_subscription(self, url, name):
-        subscriptions = self.get_subscription_names()
-        subscriptions[name] = url
-        tss = self.get_subscriptions_last_ts()
-        tss[name] = datetime.min
-        self['subscription_names'] = subscriptions
-        self['subscriptions_last_ts'] = tss
 
+    def remove_subscription(self, name, username=None):
+        if username:
+            user_subscriptions = self.get('user_subscriptions', {})
+            removed = user_subscriptions.get(username, {}).pop(name, None)
+            self['user_subscriptions'] = user_subscriptions
+            return removed
+        group_subscriptions = self.get('group_subscriptions', {})
+        removed = group_subscriptions.pop(name, None)
+        self['group_subscriptions'] = group_subscriptions
+        return removed
 
-    def remove_subscription(self, name):
-        subscriptions = self.get_subscription_names()
-        tss = self.get_subscriptions_last_ts()
-        del subscriptions[name]
-        del tss[name]
-        self['subscription_names'] = subscriptions
-        self['subscriptions_last_ts'] = tss
+    def update_subscription(self, subscription):
+        if subscription.username:
+            user_subscriptions = self.get('user_subscriptions', {})
+            user_subscriptions.get(subscription.username, {})[subscription.name] = subscription
+            self['user_subscriptions'] = user_subscriptions
+        else:
+            group_subscriptions = self.get('group_subscriptions', {})
+            group_subscriptions[subscription.name] = subscription
+            self['group_subscriptions'] = group_subscriptions
 
     def clean_html(self, html_item):
         soup = BeautifulSoup(html_item)
@@ -80,38 +134,40 @@ class RSSFeedPlugin(BotPlugin):
         text = ''.join(text_parts)
         return text
 
-    def send_news(self):
+    def send_news(self, username=None):
         """
         Go through RSS subscriptions, check if there's a new update and send it to the chat.
         """
-        logging.debug('Polling rss feeds')
-        subscription_names = self.get_subscription_names()
-        subscription_tss = self.get_subscriptions_last_ts()
-        for name in subscription_names:
-            feed = parse(subscription_names[name])
-            post_canary = False
-            if feed['entries']:
-                item = feed['entries'][0]
+        logging.info('Polling rss feeds')
+        if username:
+            subscriptions = self.get_subscriptions(username=username)
+        else:
+            subscriptions = self.get_all_subscriptions()
+        canary = False
+        for subscription in subscriptions:
+            item = subscription.get_new_item(mark_read=True)
+            if item:
+                canary = True
                 item_date = get_item_date(item)
-                if item_date > subscription_tss[name]:
-                    subscription_tss[name] = item_date
-                    self.send(CHATROOM_PRESENCE[0], '%s News from %s:\n%s' % (item_date, name, self.clean_html(item.summary)), message_type='groupchat')
-                    self.send(CHATROOM_PRESENCE[0], '\n%s\n' % str(item.link), message_type='groupchat')
-                    self['subscriptions_last_ts'] = subscription_tss
-                    post_canary = True
-            if not post_canary:
-                logging.debug('No new rss item for %s' % name)
+                recipient = getattr(subscription, 'username', None) or CHATROOM_PRESENCE[0]
+                message_type = 'chat' if subscription.username else 'groupchat'
+                self.send(recipient, '%s News from %s:\n%s' % (item_date, subscription.name, self.clean_html(item.summary)), message_type=message_type)
+                self.send(recipient, '\n%s\n' % str(item.link), message_type=message_type)
+                self.update_subscription(subscription)
+        if not canary and username:
+            logging.info('No new news')
+            self.send(username, 'No new news.\n', message_type='chat')
 
     def activate(self):
         super(RSSFeedPlugin, self).activate()
-        if not CHATROOM_PRESENCE:
-            raise Exception('You need at least one chatroom configured')
         self.start_poller(self.config['POLL_INTERVAL'] if self.config else DEFAULT_POLL_INTERVAL, self.send_news)
 
     @botcmd(split_args_with=' ')
     def rss_add(self, mess, args):
         """
         Add a feed: !rss add feed_url feed_nickname
+        The feed will be added to your personal list if you are in a 1-1 chat with the bot,
+        or the group list if you are in a group chat room.
         """
         if len(args) < 2:
             return 'Please supply a feed url and a nickname'
@@ -123,10 +179,14 @@ class RSSFeedPlugin(BotPlugin):
             feed_name += args[i] + ' '
         feed_name = feed_name.strip()
 
-        if feed_name in self.get_subscription_names():
+        username = None
+        if mess.getType() == 'chat' or not CHATROOM_PRESENCE:
+            username = mess.getFrom().getStripped()
+
+        if feed_name in [subscription.name for subscription in self.get_subscriptions(username=username)]:
             return 'this feed already exists'
-        self.add_subscription(feed_url, feed_name)
-        return 'Feed %s added as %s' % (feed_url, feed_name)
+        self.add_subscription(feed_url, feed_name, username)
+        return 'Feed %s added as %s for %s' % (feed_url, feed_name, username if username else 'group chat')
 
 
     @botcmd
@@ -137,10 +197,14 @@ class RSSFeedPlugin(BotPlugin):
         if not args:
             return 'Please supply a feed nickname'
         feed_name = args.strip()
-        if feed_name not in self.get_subscription_names():
+
+        username = mess.getFrom().getStripped()
+        removed = self.remove_subscription(feed_name, username=username)
+        if not removed:
+            removed = self.remove_subscription(feed_name, username=None)
+        if not removed:
             return 'Sorry.. unknown feed...'
-        self.remove_subscription(feed_name)
-        return 'Feed %s was successfully removed.' % feed_name
+        return 'Feed %s was successfully removed.' % removed.name
 
 
     @botcmd(split_args_with=' ')
@@ -148,9 +212,14 @@ class RSSFeedPlugin(BotPlugin):
         """
         Display all active feeds with last update date
         """
+        username = None
+        if mess.getType() == 'chat':
+            username = mess.getFrom().getStripped()
+
+        subscriptions = self.get_subscriptions(username=username)
         ans = ''
-        for sub_name in self.get_subscriptions_last_ts():
-            ans += '%s  last updated: %s (from %s)\n' % (sub_name, self.get_subscriptions_last_ts()[sub_name], self.get_subscription_names()[sub_name])
+        for subscription in subscriptions:
+            ans += '\n%s  last updated: %s (from %s)' % (subscription.name, subscription.last_timestamp, subscription.url)
 
         return ans
 
@@ -159,8 +228,8 @@ class RSSFeedPlugin(BotPlugin):
     def rss_clearfeeds(self, mess, args):
         """ WARNING : Deletes all existing feeds
         """
-        self['subscription_names'] = {}
-        self['subscriptions_last_ts'] = {}
+        self['user_subscriptions'] = {}
+        self['group_subscriptions'] = {}
         return 'all rss feeds were removed'
 
     @botcmd
@@ -168,4 +237,7 @@ class RSSFeedPlugin(BotPlugin):
         """
         Go through RSS subscriptions, check if there's a new update and send it to the chat.
         """
-        return self.send_news()
+        username = None
+        if mess.getType() == 'chat':
+            username = mess.getFrom().getStripped()
+        return self.send_news(username=username)
